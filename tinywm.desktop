@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=TinyWM
+Comment=Small, keyboard-driven X11 window manager
+Exec=tinywm
+Type=Application
+DesktopNames=TinyWM
