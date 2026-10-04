@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /* TinyWM is written by Nick Welch <nick@incise.org> in 2005 & 2011.
  *
  * This software is in the public domain
@@ -18,17 +20,21 @@
 
 #define LENGTH(a) (sizeof(a) / sizeof((a)[0]))
 #define MAX_CLIENTS 512
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 enum { WM_DELETE, NET_SUPPORTED, NET_CLIENT_LIST, NET_ACTIVE_WINDOW,
        NET_CURRENT_DESKTOP, NET_NUMBER_OF_DESKTOPS, NET_WM_NAME,
        NET_WM_STATE, NET_WM_STATE_FULLSCREEN, NET_WM_WINDOW_TYPE,
        NET_WM_WINDOW_TYPE_DOCK, NET_WM_WINDOW_TYPE_DIALOG,
-       NET_WM_WINDOW_TYPE_SPLASH, NET_WM_STRUT_PARTIAL, ATOM_COUNT };
+       NET_WM_WINDOW_TYPE_SPLASH, NET_WM_STRUT_PARTIAL, NET_WORKAREA,
+       ATOM_COUNT };
 
 typedef struct {
     Window win;
     int desktop;
     int ignore_unmap;
+    int mapped;
     int floating;
     int fullscreen;
     int maximized;
@@ -46,6 +52,7 @@ static int work_x, work_y, work_w, work_h;
 static XButtonEvent drag;
 static XWindowAttributes drag_attr;
 static unsigned long focus_color, unfocus_color;
+static int startup_error;
 
 static void update_clients(void);
 static void arrange(void);
@@ -55,7 +62,8 @@ static int
 xerror(Display *display, XErrorEvent *event)
 {
     (void)display;
-    (void)event;
+    if (event->error_code == BadAccess)
+        startup_error = 1;
     return 0;
 }
 
@@ -78,7 +86,8 @@ client_for(Window win)
 }
 
 static int
-get_property(Window win, Atom property, Atom type, unsigned long *value)
+get_property(Window win, Atom property, Atom type, unsigned long *values,
+        unsigned long capacity, unsigned long *nvalues)
 {
     Atom actual;
     int format;
@@ -86,10 +95,11 @@ get_property(Window win, Atom property, Atom type, unsigned long *value)
     unsigned char *data = NULL;
     int result = 0;
 
-    if (XGetWindowProperty(dpy, win, property, 0, 32, False, type, &actual,
-            &format, &count, &after, &data) == Success && data != NULL &&
-            format == 32 && count > 0) {
-        *value = *(unsigned long *)data;
+    if (XGetWindowProperty(dpy, win, property, 0, (long)capacity, False, type,
+            &actual, &format, &count, &after, &data) == Success && data != NULL &&
+            actual == type && format == 32 && count > 0 && count <= capacity) {
+        memcpy(values, data, count * sizeof(*values));
+        *nvalues = count;
         result = 1;
     }
     if (data != NULL)
@@ -108,7 +118,7 @@ has_type(Window win, Atom type)
 
     if (XGetWindowProperty(dpy, win, atoms[NET_WM_WINDOW_TYPE], 0, 32, False,
             XA_ATOM, &actual, &format, &count, &after, &data) == Success &&
-            data != NULL && format == 32) {
+            data != NULL && actual == XA_ATOM && format == 32) {
         Atom *types = (Atom *)data;
         for (i = 0; i < count; i++)
             if (types[i] == type)
@@ -122,35 +132,39 @@ has_type(Window win, Atom type)
 static void
 publish_workarea(void)
 {
-    unsigned long area[4];
+    unsigned long area[9 * 4];
     size_t i;
+    int left = 0, right = 0, top = 0, bottom = 0;
     work_x = 0;
     work_y = 0;
     work_w = screen_w;
     work_h = screen_h;
     for (i = 0; i < nclients; i++) {
-        unsigned long strut[12] = {0};
+        unsigned long strut[12] = {0}, nstrut = 0;
         Client *c = &clients[i];
         if (!has_type(c->win, atoms[NET_WM_WINDOW_TYPE_DOCK]))
             continue;
         if (!get_property(c->win, atoms[NET_WM_STRUT_PARTIAL], XA_CARDINAL,
-                strut))
+                strut, LENGTH(strut), &nstrut) || nstrut < 4)
             continue;
-        if (strut[0] > 0 && strut[0] < (unsigned long)screen_w) {
-            work_x = (int)strut[0];
-            work_w = screen_w - work_x - (int)strut[1];
-        }
-        if (strut[2] > 0 && strut[2] < (unsigned long)screen_h) {
-            work_y = (int)strut[2];
-            work_h = screen_h - work_y - (int)strut[3];
-        }
+        left = MAX(left, (int)MIN(strut[0], (unsigned long)screen_w));
+        right = MAX(right, (int)MIN(strut[1], (unsigned long)screen_w));
+        top = MAX(top, (int)MIN(strut[2], (unsigned long)screen_h));
+        bottom = MAX(bottom, (int)MIN(strut[3], (unsigned long)screen_h));
     }
-    area[0] = (unsigned long)work_x;
-    area[1] = (unsigned long)work_y;
-    area[2] = (unsigned long)work_w;
-    area[3] = (unsigned long)work_h;
-    XChangeProperty(dpy, root, XInternAtom(dpy, "_NET_WORKAREA", False),
-            XA_CARDINAL, 32, PropModeReplace, (unsigned char *)area, 4);
+    work_x = MIN(left, screen_w - 1);
+    work_y = MIN(top, screen_h - 1);
+    work_w = MAX(1, screen_w - work_x - MIN(right, screen_w - work_x - 1));
+    work_h = MAX(1, screen_h - work_y - MIN(bottom, screen_h - work_y - 1));
+    for (i = 0; i < LENGTH(area) / 4; i++) {
+        area[i * 4] = (unsigned long)work_x;
+        area[i * 4 + 1] = (unsigned long)work_y;
+        area[i * 4 + 2] = (unsigned long)work_w;
+        area[i * 4 + 3] = (unsigned long)work_h;
+    }
+    XChangeProperty(dpy, root, atoms[NET_WORKAREA],
+            XA_CARDINAL, 32, PropModeReplace, (unsigned char *)area,
+            (int)LENGTH(area));
 }
 
 static void
@@ -168,9 +182,11 @@ static void
 set_active(Window win)
 {
     unsigned long value = (unsigned long)win;
-    XChangeProperty(dpy, root, atoms[NET_ACTIVE_WINDOW], XA_WINDOW, 32,
-            PropModeReplace, win == None ? NULL : (unsigned char *)&value,
-            win == None ? 0 : 1);
+    if (win == None)
+        XDeleteProperty(dpy, root, atoms[NET_ACTIVE_WINDOW]);
+    else
+        XChangeProperty(dpy, root, atoms[NET_ACTIVE_WINDOW], XA_WINDOW, 32,
+                PropModeReplace, (unsigned char *)&value, 1);
 }
 
 static void
@@ -189,22 +205,15 @@ focus_window(Window win)
     set_active(win);
 }
 
-static int
-managed_type(Window win)
-{
-    return !has_type(win, atoms[NET_WM_WINDOW_TYPE_DOCK]);
-}
-
 static void
 manage(Window win)
 {
     XWindowAttributes attr;
     XSetWindowAttributes changes;
     Client *c;
-    unsigned long state = 0;
+    size_t i;
     if (client_for(win) != NULL || nclients == MAX_CLIENTS ||
-            !XGetWindowAttributes(dpy, win, &attr) || attr.override_redirect ||
-            !managed_type(win))
+            !XGetWindowAttributes(dpy, win, &attr) || attr.override_redirect)
         return;
     c = &clients[nclients++];
     memset(c, 0, sizeof(*c));
@@ -214,22 +223,38 @@ manage(Window win)
     c->y = attr.y;
     c->w = attr.width;
     c->h = attr.height;
-    c->floating = has_type(win, atoms[NET_WM_WINDOW_TYPE_DIALOG]) ||
+    c->floating = has_type(win, atoms[NET_WM_WINDOW_TYPE_DOCK]) ||
+            has_type(win, atoms[NET_WM_WINDOW_TYPE_DIALOG]) ||
             has_type(win, atoms[NET_WM_WINDOW_TYPE_SPLASH]);
-    get_property(win, atoms[NET_WM_STATE], XA_ATOM, &state);
-    c->fullscreen = state == (unsigned long)atoms[NET_WM_STATE_FULLSCREEN];
+    c->mapped = attr.map_state != IsUnmapped;
+    {
+        unsigned long states[8], nstates = 0;
+        if (get_property(win, atoms[NET_WM_STATE], XA_ATOM, states,
+                LENGTH(states), &nstates))
+            for (i = 0; i < nstates; i++)
+                if (states[i] == (unsigned long)atoms[NET_WM_STATE_FULLSCREEN])
+                    c->fullscreen = 1;
+    }
     changes.event_mask = EnterWindowMask | FocusChangeMask | StructureNotifyMask |
-            PropertyChangeMask;
+            PropertyChangeMask | ButtonPressMask;
     XChangeWindowAttributes(dpy, win, CWEventMask, &changes);
-    XSetWindowBorderWidth(dpy, win, BORDER_WIDTH);
-    XSetWindowBorder(dpy, win, unfocus_color);
-    XMapWindow(dpy, win);
+    if (!has_type(win, atoms[NET_WM_WINDOW_TYPE_DOCK])) {
+        XSetWindowBorderWidth(dpy, win, BORDER_WIDTH);
+        XSetWindowBorder(dpy, win, unfocus_color);
+    }
+    if (c->desktop == desktop) {
+        c->mapped = 1;
+        XMapWindow(dpy, win);
+    }
     update_clients();
     publish_workarea();
     if (!c->floating && tiled)
         arrange();
     if (FOCUS_FOLLOWS_MOUSE)
         focus_window(win);
+    if (c->fullscreen)
+        XMoveResizeWindow(dpy, win, 0, 0, (unsigned)screen_w,
+                (unsigned)screen_h);
 }
 
 static void
@@ -247,6 +272,13 @@ unmanage(Window win)
         update_clients();
         publish_workarea();
         arrange();
+        for (i = 0; i < nclients; i++)
+            if (clients[i].desktop == desktop &&
+                    !has_type(clients[i].win,
+                        atoms[NET_WM_WINDOW_TYPE_DOCK])) {
+                focus_window(clients[i].win);
+                break;
+            }
         return;
     }
 }
@@ -258,10 +290,13 @@ switch_desktop(int next)
     desktop = next;
     for (i = 0; i < nclients; i++) {
         Client *c = &clients[i];
-        if (c->desktop == desktop)
+        int dock = has_type(c->win, atoms[NET_WM_WINDOW_TYPE_DOCK]);
+        if ((c->desktop == desktop || dock) && !c->mapped) {
+            c->mapped = 1;
             XMapWindow(dpy, c->win);
-        else {
+        } else if (c->desktop != desktop && !dock && c->mapped) {
             c->ignore_unmap++;
+            c->mapped = 0;
             XUnmapWindow(dpy, c->win);
         }
     }
@@ -328,6 +363,17 @@ launch(const char *program, char *const fallback[])
 }
 
 static void
+launch_script(const char *path)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl(path, path, (char *)NULL);
+        _exit(127);
+    }
+}
+
+static void
 close_window(Window win)
 {
     Atom *protocols;
@@ -356,15 +402,45 @@ close_window(Window win)
 static void
 set_fullscreen(Client *c, int enabled)
 {
-    unsigned long state = (unsigned long)atoms[NET_WM_STATE_FULLSCREEN];
+    Atom actual;
+    int format;
+    unsigned long count, after, i;
+    unsigned char *data = NULL;
+    Atom states[32];
+    int nstates = 0;
+    XWindowAttributes attr;
+
+    if (c->fullscreen == enabled)
+        return;
+    if (enabled && XGetWindowAttributes(dpy, c->win, &attr)) {
+        c->x = attr.x;
+        c->y = attr.y;
+        c->w = attr.width;
+        c->h = attr.height;
+    }
     c->fullscreen = enabled;
-    if (enabled) {
+    if (XGetWindowProperty(dpy, c->win, atoms[NET_WM_STATE], 0, 32, False,
+            XA_ATOM, &actual, &format, &count, &after, &data) == Success &&
+            data != NULL && actual == XA_ATOM && format == 32) {
+        Atom *old = (Atom *)data;
+        for (i = 0; i < count &&
+                nstates < (int)LENGTH(states) - (enabled ? 1 : 0); i++)
+            if (old[i] != atoms[NET_WM_STATE_FULLSCREEN])
+                states[nstates++] = old[i];
+    }
+    if (data != NULL)
+        XFree(data);
+    if (enabled)
+        states[nstates++] = atoms[NET_WM_STATE_FULLSCREEN];
+    if (nstates > 0)
         XChangeProperty(dpy, c->win, atoms[NET_WM_STATE], XA_ATOM, 32,
-                PropModeReplace, (unsigned char *)&state, 1);
+                PropModeReplace, (unsigned char *)states, nstates);
+    else
+        XDeleteProperty(dpy, c->win, atoms[NET_WM_STATE]);
+    if (enabled) {
         XMoveResizeWindow(dpy, c->win, 0, 0, (unsigned)screen_w,
                 (unsigned)screen_h);
     } else {
-        XDeleteProperty(dpy, c->win, atoms[NET_WM_STATE]);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, (unsigned)c->w,
                 (unsigned)c->h);
         arrange();
@@ -406,9 +482,17 @@ key_press(XKeyEvent *event)
     }
     if (state == (Mod1Mask | ShiftMask) && key >= XK_1 && key <= XK_9) {
         if (c != NULL) {
-            c->desktop = (int)(key - XK_1);
-            if (c->desktop != desktop) {
+            int target = (int)(key - XK_1);
+            if (c->desktop != target) {
+                c->desktop = target;
+                if (focused == c->win) {
+                    focused = None;
+                    set_active(None);
+                }
+            }
+            if (c->desktop != desktop && c->mapped) {
                 c->ignore_unmap++;
+                c->mapped = 0;
                 XUnmapWindow(dpy, c->win);
             }
             update_clients();
@@ -427,18 +511,18 @@ key_press(XKeyEvent *event)
     else if (state == Mod1Mask && key == XK_Return)
         launch(TERMINAL, NULL);
     else if (state == Mod1Mask && key == XK_p) {
-        char *const fallback[] = {"rofi", "-show", "drun", NULL};
-        launch("dmenu_run", fallback);
+        launch("if command -v dmenu_run >/dev/null 2>&1; then "
+                "exec dmenu_run; else exec rofi -show drun; fi", NULL);
     } else if (state == Mod1Mask && key == XK_Tab && nclients > 0) {
+        int start = -1;
         for (i = 0; i < (int)nclients; i++)
             if (clients[i].win == focused)
-                break;
+                start = i;
         for (i = 1; i <= (int)nclients; i++) {
-            Client *next = &clients[((i + (i <= (int)nclients ? 0 : 0)) %
-                    (int)nclients)];
-            if (focused == None || next->win == focused)
-                continue;
-            if (next->desktop == desktop) {
+            int index = (start + i) % (int)nclients;
+            Client *next = &clients[index];
+            if (next->desktop == desktop &&
+                    !has_type(next->win, atoms[NET_WM_WINDOW_TYPE_DOCK])) {
                 focus_window(next->win);
                 break;
             }
@@ -448,10 +532,13 @@ key_press(XKeyEvent *event)
         arrange();
     } else if (state == Mod1Mask && key == XK_f && c != NULL) {
         if (!c->maximized) {
-            c->x = 0;
-            c->y = 0;
-            c->w = screen_w;
-            c->h = screen_h;
+            XWindowAttributes attr;
+            if (XGetWindowAttributes(dpy, c->win, &attr)) {
+                c->x = attr.x;
+                c->y = attr.y;
+                c->w = attr.width;
+                c->h = attr.height;
+            }
             c->maximized = 1;
             XMoveResizeWindow(dpy, c->win, 0, 0, (unsigned)screen_w,
                     (unsigned)screen_h);
@@ -477,8 +564,9 @@ main(void)
         "_NET_NUMBER_OF_DESKTOPS", "_NET_WM_NAME", "_NET_WM_STATE",
         "_NET_WM_STATE_FULLSCREEN", "_NET_WM_WINDOW_TYPE",
         "_NET_WM_WINDOW_TYPE_DOCK", "_NET_WM_WINDOW_TYPE_DIALOG",
-        "_NET_WM_WINDOW_TYPE_SPLASH", "_NET_WM_STRUT_PARTIAL"};
-    unsigned long supported[8], value;
+        "_NET_WM_WINDOW_TYPE_SPLASH", "_NET_WM_STRUT_PARTIAL",
+        "_NET_WORKAREA"};
+    unsigned long supported[14], value;
     int i;
     struct sigaction sa;
 
@@ -504,6 +592,11 @@ main(void)
     sigaction(SIGCHLD, &sa, NULL);
     XSelectInput(dpy, root, SubstructureRedirectMask | SubstructureNotifyMask |
             ButtonPressMask | EnterWindowMask | PropertyChangeMask);
+    XSync(dpy, False);
+    if (startup_error) {
+        XCloseDisplay(dpy);
+        return 1;
+    }
 
     supported[0] = atoms[NET_SUPPORTED];
     supported[1] = atoms[NET_CLIENT_LIST];
@@ -513,8 +606,14 @@ main(void)
     supported[5] = atoms[NET_WM_NAME];
     supported[6] = atoms[NET_WM_STATE];
     supported[7] = atoms[NET_WM_STATE_FULLSCREEN];
+    supported[8] = atoms[NET_WM_WINDOW_TYPE];
+    supported[9] = atoms[NET_WM_WINDOW_TYPE_DOCK];
+    supported[10] = atoms[NET_WM_WINDOW_TYPE_DIALOG];
+    supported[11] = atoms[NET_WM_WINDOW_TYPE_SPLASH];
+    supported[12] = atoms[NET_WM_STRUT_PARTIAL];
+    supported[13] = atoms[NET_WORKAREA];
     XChangeProperty(dpy, root, atoms[NET_SUPPORTED], XA_ATOM, 32,
-            PropModeReplace, (unsigned char *)supported, 8);
+            PropModeReplace, (unsigned char *)supported, 14);
     value = 9;
     XChangeProperty(dpy, root, atoms[NET_NUMBER_OF_DESKTOPS], XA_CARDINAL,
             32, PropModeReplace, (unsigned char *)&value, 1);
@@ -558,25 +657,42 @@ main(void)
                 XFree(children);
         }
     }
+    update_clients();
     publish_workarea();
     {
         char path[1024];
         const char *home = getenv("HOME");
-        if (home != NULL && snprintf(path, sizeof(path),
-                "%s/.config/tinywm/autostart.sh", home) < (int)sizeof(path) &&
-                access(path, X_OK) == 0)
-            launch(path, NULL);
+        int path_length;
+        if (home != NULL) {
+            path_length = snprintf(path, sizeof(path),
+                    "%s/.config/tinywm/autostart.sh", home);
+            if (path_length >= 0 && path_length < (int)sizeof(path) &&
+                    access(path, X_OK) == 0)
+                launch_script(path);
+        }
     }
     XSync(dpy, False);
     for (;;) {
         XNextEvent(dpy, &ev);
-        if (ev.type == MapRequest)
-            manage(ev.xmaprequest.window);
-        else if (ev.type == DestroyNotify)
+        if (ev.type == MapRequest) {
+            Client *c = client_for(ev.xmaprequest.window);
+            if (c == NULL)
+                manage(ev.xmaprequest.window);
+            else if (c->desktop == desktop && !c->mapped) {
+                c->mapped = 1;
+                XMapWindow(dpy, c->win);
+            }
+        }
+        else if (ev.type == DestroyNotify && ev.xdestroywindow.event == root)
             unmanage(ev.xdestroywindow.window);
-        else if (ev.type == UnmapNotify) {
+        else if (ev.type == MapNotify) {
+            Client *c = client_for(ev.xmap.window);
+            if (c != NULL)
+                c->mapped = 1;
+        } else if (ev.type == UnmapNotify && ev.xunmap.event == root) {
             Client *c = client_for(ev.xunmap.window);
             if (c != NULL) {
+                c->mapped = 0;
                 if (c->ignore_unmap > 0)
                     c->ignore_unmap--;
                 else
@@ -595,6 +711,8 @@ main(void)
             XGetWindowAttributes(dpy, ev.xbutton.subwindow, &drag_attr);
             drag = ev.xbutton;
             focus_window(ev.xbutton.subwindow);
+        } else if (ev.type == ButtonPress && ev.xbutton.window != root) {
+            focus_window(ev.xbutton.window);
         } else if (ev.type == MotionNotify && drag.subwindow != None) {
             Client *c = client_for(drag.subwindow);
             int dx = ev.xmotion.x_root - drag.x_root;
@@ -609,14 +727,36 @@ main(void)
                         (unsigned)MAX(1, drag_attr.height +
                             (drag.button == Button3 ? dy : 0)));
             }
-        } else if (ev.type == ButtonRelease)
+        } else if (ev.type == ButtonRelease) {
+            if (drag.subwindow != None) {
+                Client *c = client_for(drag.subwindow);
+                XWindowAttributes attr;
+                if (c != NULL && XGetWindowAttributes(dpy, c->win, &attr)) {
+                    c->x = attr.x;
+                    c->y = attr.y;
+                    c->w = attr.width;
+                    c->h = attr.height;
+                }
+            }
             drag.subwindow = None;
-        else if (ev.type == KeyPress)
+        } else if (ev.type == KeyPress)
             key_press(&ev.xkey);
         else if (ev.type == EnterNotify && FOCUS_FOLLOWS_MOUSE &&
                 ev.xcrossing.mode == NotifyNormal)
             focus_window(ev.xcrossing.window);
         else if (ev.type == ClientMessage &&
+                ev.xclient.message_type == atoms[NET_CURRENT_DESKTOP] &&
+                ev.xclient.data.l[0] >= 0 && ev.xclient.data.l[0] < 9)
+            switch_desktop((int)ev.xclient.data.l[0]);
+        else if (ev.type == ClientMessage &&
+                ev.xclient.message_type == atoms[NET_ACTIVE_WINDOW]) {
+            Client *c = client_for(ev.xclient.window);
+            if (c != NULL) {
+                if (c->desktop != desktop)
+                    switch_desktop(c->desktop);
+                focus_window(c->win);
+            }
+        } else if (ev.type == ClientMessage &&
                 ev.xclient.message_type == atoms[NET_WM_STATE] &&
                 ((Atom)ev.xclient.data.l[1] ==
                  atoms[NET_WM_STATE_FULLSCREEN] ||
@@ -624,7 +764,7 @@ main(void)
                  atoms[NET_WM_STATE_FULLSCREEN])) {
             Client *c = client_for(ev.xclient.window);
             int action = (int)ev.xclient.data.l[0];
-            if (c != NULL)
+            if (c != NULL && action >= 0 && action <= 2)
                 set_fullscreen(c, action == 1 ||
                         (action == 2 && !c->fullscreen));
         } else if (ev.type == PropertyNotify &&
