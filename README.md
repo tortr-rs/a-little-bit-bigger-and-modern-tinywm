@@ -22,6 +22,8 @@ not a Wayland compositor.
   are also handled.
 - EWMH desktop/client/active-window properties, dock/dialog/splash window types,
   and dock struts for the work area.
+- Native wallpaper: loads a binary PPM from `~/.config/tinywm/wallpaper.ppm`
+  (scaled to cover the screen), with a solid-color fallback.
 - Handles map, configure, destroy, and unmap events, requests WM_DELETE_WINDOW
   before falling back to XKillClient, reaps children, and runs an optional
   autostart script.
@@ -46,16 +48,29 @@ simple X11 setups.
 | Alt+F | Toggle maximize |
 | Alt+Arrow | Snap focused window to a screen half |
 | Alt+T | Toggle master/stack tiling |
+| Alt+Shift+W | Reload the wallpaper |
 | Alt+Shift+Q | Quit TinyWM |
 
 ## Configuration
 
 Edit `config.h`, then rebuild. `BORDER_WIDTH`, `FOCUS_COLOR`, and
 `UNFOCUS_COLOR` configure borders; `FOCUS_FOLLOWS_MOUSE` can be set to `1`;
-`TERMINAL` sets the terminal command. The defaults are deliberately modest.
+`TERMINAL` sets the terminal command; `WALLPAPER_PATH` (relative to `$HOME`)
+and `WALLPAPER_COLOR` (fallback color) configure the wallpaper. The defaults are deliberately modest.
 
 TinyWM runs `~/.config/tinywm/autostart.sh` when the file exists and is
 executable. Use it to start a panel, compositor, or other session utilities.
+
+## Wallpaper
+
+At startup, before the autostart script, TinyWM loads `~/.config/tinywm/wallpaper.ppm`,
+scales it to cover the screen (nearest-neighbor, cropping to keep the aspect
+ratio), and sets it as the root background, also publishing `_XROOTPMAP_ID` and
+`ESETROOT_PMAP_ID` for compositors and transparent terminals. Only 8-bit binary
+PPM (`P6`, maxval 255) on a TrueColor visual is supported; otherwise
+`WALLPAPER_COLOR` is used. Convert other formats with
+`convert image.jpg ~/.config/tinywm/wallpaper.ppm`. Press Alt+Shift+W to reload
+without restarting. Tools such as `feh` in the autostart script can override it.
 
 ## Installation guide
 

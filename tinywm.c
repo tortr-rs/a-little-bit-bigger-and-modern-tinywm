@@ -8,6 +8,7 @@
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,7 @@ static XButtonEvent drag;
 static XWindowAttributes drag_attr;
 static unsigned long focus_color, unfocus_color;
 static int startup_error;
+static Pixmap wallpaper_pm;
 
 static void update_clients(void);
 static void arrange(void);
@@ -468,6 +470,137 @@ snap(Client *c, KeySym key)
             (unsigned)MAX(1, h - 2 * BORDER_WIDTH));
 }
 
+static int
+ppm_token(FILE *f, unsigned long *out)
+{
+    int ch;
+    do {
+        ch = fgetc(f);
+        if (ch == '#')
+            while (ch != '\n' && ch != EOF)
+                ch = fgetc(f);
+    } while (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r');
+    if (ch < '0' || ch > '9')
+        return 0;
+    *out = 0;
+    while (ch >= '0' && ch <= '9') {
+        *out = *out * 10 + (unsigned long)(ch - '0');
+        if (*out > 65535)
+            return 0;
+        ch = fgetc(f);
+    }
+    return 1;
+}
+
+static unsigned long
+pack_channel(unsigned long mask, unsigned long value)
+{
+    int shift = 0, bits = 0;
+    unsigned long m;
+    if (mask == 0)
+        return 0;
+    while (!((mask >> shift) & 1))
+        shift++;
+    for (m = mask >> shift; m; m >>= 1)
+        bits++;
+    if (bits > 8)
+        return (value << (bits - 8)) << shift;
+    return (value >> (8 - bits)) << shift;
+}
+
+/* Returns a screen-sized pixmap or None. Scales to cover, nearest-neighbor. */
+static Pixmap
+load_ppm(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    unsigned long iw, ih, maxval;
+    unsigned char *src = NULL;
+    char *dst = NULL;
+    XImage *img = NULL;
+    Pixmap pm = None;
+    int scr = DefaultScreen(dpy), depth = DefaultDepth(dpy, scr);
+    Visual *vis = DefaultVisual(dpy, scr);
+    int x, y;
+    double scale;
+    int ox, oy;
+
+    if (f == NULL)
+        return None;
+    if (fgetc(f) != 'P' || fgetc(f) != '6' || !ppm_token(f, &iw) ||
+            !ppm_token(f, &ih) || !ppm_token(f, &maxval) || iw == 0 ||
+            ih == 0 || maxval != 255 || vis->class != TrueColor ||
+            iw > 16384 || ih > 16384)
+        goto out;
+    src = malloc(iw * ih * 3);
+    if (src == NULL || fread(src, 3, iw * ih, f) != iw * ih)
+        goto out;
+    dst = malloc((size_t)screen_w * (size_t)screen_h * 4);
+    if (dst == NULL)
+        goto out;
+    img = XCreateImage(dpy, vis, (unsigned)depth, ZPixmap, 0, dst,
+            (unsigned)screen_w, (unsigned)screen_h, 32, 0);
+    if (img == NULL)
+        goto out;
+    scale = MAX((double)screen_w / (double)iw, (double)screen_h / (double)ih);
+    ox = (int)(((double)iw * scale - screen_w) / 2);
+    oy = (int)(((double)ih * scale - screen_h) / 2);
+    for (y = 0; y < screen_h; y++) {
+        unsigned long sy = MIN(ih - 1, (unsigned long)((y + oy) / scale));
+        for (x = 0; x < screen_w; x++) {
+            unsigned long sx = MIN(iw - 1, (unsigned long)((x + ox) / scale));
+            unsigned char *p = src + (sy * iw + sx) * 3;
+            XPutPixel(img, x, y, pack_channel(vis->red_mask, p[0]) |
+                    pack_channel(vis->green_mask, p[1]) |
+                    pack_channel(vis->blue_mask, p[2]));
+        }
+    }
+    pm = XCreatePixmap(dpy, root, (unsigned)screen_w, (unsigned)screen_h,
+            (unsigned)depth);
+    XPutImage(dpy, pm, DefaultGC(dpy, scr), img, 0, 0, 0, 0,
+            (unsigned)screen_w, (unsigned)screen_h);
+out:
+    if (img != NULL)
+        XDestroyImage(img); /* also frees dst */
+    else
+        free(dst);
+    free(src);
+    fclose(f);
+    return pm;
+}
+
+static void
+set_wallpaper(void)
+{
+    char path[1024];
+    const char *home = getenv("HOME");
+    Pixmap pm = None;
+    Atom prop_root = XInternAtom(dpy, "_XROOTPMAP_ID", False);
+    Atom prop_eset = XInternAtom(dpy, "ESETROOT_PMAP_ID", False);
+
+    if (home != NULL && snprintf(path, sizeof(path), "%s/%s", home,
+            WALLPAPER_PATH) < (int)sizeof(path))
+        pm = load_ppm(path);
+    if (pm != None) {
+        unsigned long id = (unsigned long)pm;
+        XSetWindowBackgroundPixmap(dpy, root, pm);
+        XChangeProperty(dpy, root, prop_root, XA_PIXMAP, 32, PropModeReplace,
+                (unsigned char *)&id, 1);
+        XChangeProperty(dpy, root, prop_eset, XA_PIXMAP, 32, PropModeReplace,
+                (unsigned char *)&id, 1);
+    } else {
+        XColor c, exact;
+        XDeleteProperty(dpy, root, prop_root);
+        XDeleteProperty(dpy, root, prop_eset);
+        if (XAllocNamedColor(dpy, DefaultColormap(dpy, DefaultScreen(dpy)),
+                WALLPAPER_COLOR, &c, &exact))
+            XSetWindowBackground(dpy, root, c.pixel);
+    }
+    XClearWindow(dpy, root);
+    if (wallpaper_pm != None)
+        XFreePixmap(dpy, wallpaper_pm);
+    wallpaper_pm = pm;
+}
+
 static void
 key_press(XKeyEvent *event)
 {
@@ -498,6 +631,10 @@ key_press(XKeyEvent *event)
             update_clients();
             arrange();
         }
+        return;
+    }
+    if (state == (Mod1Mask | ShiftMask) && key == XK_w) {
+        set_wallpaper();
         return;
     }
     if (state == (Mod1Mask | ShiftMask) && key == XK_q) {
@@ -639,6 +776,8 @@ main(void)
                     True, GrabModeAsync, GrabModeAsync);
         XGrabKey(dpy, XKeysymToKeycode(dpy, XK_q), Mod1Mask | ShiftMask,
                 root, True, GrabModeAsync, GrabModeAsync);
+        XGrabKey(dpy, XKeysymToKeycode(dpy, XK_w), Mod1Mask | ShiftMask,
+                root, True, GrabModeAsync, GrabModeAsync);
     }
     XGrabButton(dpy, Button1, Mod1Mask, root, True, ButtonPressMask |
             ButtonReleaseMask | PointerMotionMask, GrabModeAsync,
@@ -659,6 +798,7 @@ main(void)
     }
     update_clients();
     publish_workarea();
+    set_wallpaper();
     {
         char path[1024];
         const char *home = getenv("HOME");

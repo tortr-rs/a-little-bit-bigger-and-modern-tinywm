@@ -6,5 +6,7 @@
 #define UNFOCUS_COLOR "#444444"
 #define FOCUS_FOLLOWS_MOUSE 0
 #define TERMINAL "xterm"
+#define WALLPAPER_PATH ".config/tinywm/wallpaper.ppm" /* relative to $HOME */
+#define WALLPAPER_COLOR "#1a1b26"                      /* fallback */
 
 #endif
