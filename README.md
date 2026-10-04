@@ -1,6 +1,7 @@
 # TinyWM
 
 TinyWM is written by Nick Welch <nick@incise.org> in 2005 & 2011.
+and got rewritten by Rayan Koubba <koubbamohamedrayan@gmail.com> in october 2026
 
 This software is in the public domain and is provided AS IS, with NO WARRANTY.
 
